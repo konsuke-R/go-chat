@@ -1,21 +1,23 @@
 package main
 
 import (
-	"bufio"
+	"log"
 	"fmt"
-	"net"
+	"net/http"
 	"strings"
-	// redis用
 	"context"
 	"github.com/redis/go-redis/v9"
+	"github.com/gorilla/websocket"
 )
 
-var ctx = context.Background()
-var rdb *redis.Client
+// WebSocketの設定
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {return true}, // 全てのドメインからの接続を許可
+}
 
 // 型定義: クライアントに送るメッセージ
 type client struct {
-	chanName chan<- string // 送信専用チャネル
+	send chan string
 	username string
 }
 
@@ -26,6 +28,9 @@ var (
 	leaving = make(chan client)
 	// 全員に配るメッセージ用のチャネル
 	messages = make(chan string)
+	
+	ctx = context.Background()
+	rdb *redis.Client
 )
 
 
@@ -36,28 +41,18 @@ func main() {
 		Addr: "redis:6379", // docker-composeで指定したサービス名
 	})
 
-	// 8080ポートで待ち受け
-	ln, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	
-	fmt.Println("Server is running on :8080")
-
 	// 管理人(ブロードキャスター)を1つの独立した並行処理として起動
 	go broadcaster()
 
-	for {
-		// 接続を受け入れる
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Println(err)
-			continue
-		}
-		
-		// クライアントごとの並行処理を開始
-		go handleConn(conn)
+	// HTTPハンドラの設定
+	http.HandleFunc("/ws", handleConnections)
+	// 静的ファイル(index.html)をルートで表示
+	http.Handle("/", http.FileServer(http.Dir(".")))
+
+	fmt.Println("WebSocket Chat Server started on :8080")
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
 	}
 }
 
@@ -70,68 +65,63 @@ func broadcaster() {
 		case msg := <- messages:
 			// Redisにログを保存(10件を維持)
 			rdb.LPush(ctx, "chat_history", msg)
-			rdb.LTrim(ctx, "chat_history", 0, 9)
+			rdb.LTrim(ctx, "chat_history", 0, 19)
 
 			// 全員にメッセージを配信
 			for cli := range clients {
-				cli.chanName <- msg
+				cli.send <- msg
 			}
 		case cli := <-entering:
 			clients[cli] = true
 
-			// 入室した人に過去のログを届ける
-			lastMsgs, _ := rdb.LRange(ctx, "chat_history", 0, 9).Result()
+			// 履歴を送信
+			lastMsgs, _ := rdb.LRange(ctx, "chat_history", 0, 19).Result()
 			for i := len(lastMsgs) - 1; i >= 0; i-- {
-				cli.chanName <- "HISTORY: " + lastMsgs[i]
+				cli.send <- "HISTORY: " + lastMsgs[i]
 			}
 			
 		case cli := <- leaving:
 			delete(clients, cli)
-			close(cli.chanName)
+			close(cli.send)
 		}
 	}
 }
 
-func handleConn(conn net.Conn) {
-	ch := make(chan string) // 個別のクライアント用のチャネル
-	// クライアントへの送信専用Goroutineを起動
-	go clientWriter(conn, ch)
-
-	// 最初に入力された文字列を「名前」にする
-	fmt.Fprint(conn, "Enter your name: ")
-	input := bufio.NewScanner(conn)
-	var username string
-	if input.Scan() {
-		username = input.Text()
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	// HTTPをWebSocketにアップグレード
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer ws.Close()
 
+	ch := make(chan string)
+	go clientWriter(ws, ch)
+
+	// 最初は名無し
+	username := "Anonymouse"
 	cli := client{ch, username}
-	ch <- "Welcome, " + username + "!"
-	messages <- username + " has joined the room"
 	entering <- cli
 
-	for input.Scan() {
-		text := input.Text()
+	for{
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			leaving <- cli
+			break
+		}
+		text := string(msg)
 
-		// コマンド処理の例
 		if strings.HasPrefix(text, "/nick ") {
-			newNick := strings.TrimPrefix(text, "/nick ")
-			messages <- fmt.Sprintf("SYSTEM: %s changed name to %s", username, newNick)
-			username = newNick
-			// 本来はboradcaster側のmapも更新する必要がある
+			username = strings.TrimPrefix(text, "/nick ")
+			messages <- "SYSTEM: User changed name to " + username
 			continue
 		}
-
 		messages <- username + ": " + text
 	}
-
-	leaving <- cli
-	messages <- username + " has left"
-	conn.Close()
 }
 
-func clientWriter(conn net.Conn, ch <- chan string) {
+func clientWriter(ws *websocket.Conn, ch <- chan string) {
 	for msg := range ch {
-		fmt.Fprintln(conn, msg)
+		ws.WriteMessage(websocket.TextMessage, []byte(msg))
 	}
 }
