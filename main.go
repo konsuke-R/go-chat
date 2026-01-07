@@ -5,7 +5,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	// redis用
+	"context"
+	"github.com/redis/go-redis/v9"
 )
+
+var ctx = context.Background()
+var rdb *redis.Client
 
 // 型定義: クライアントに送るメッセージ
 type client struct {
@@ -24,6 +30,12 @@ var (
 
 
 func main() {
+
+	// Redisに接続
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "redis:6379", // docker-composeで指定したサービス名
+	})
+
 	// 8080ポートで待ち受け
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
@@ -56,12 +68,23 @@ func broadcaster() {
 	for {
 		select {
 		case msg := <- messages:
+			// Redisにログを保存(10件を維持)
+			rdb.LPush(ctx, "chat_history", msg)
+			rdb.LTrim(ctx, "chat_history", 0, 9)
+
 			// 全員にメッセージを配信
 			for cli := range clients {
 				cli.chanName <- msg
 			}
 		case cli := <-entering:
 			clients[cli] = true
+
+			// 入室した人に過去のログを届ける
+			lastMsgs, _ := rdb.LRange(ctx, "chat_history", 0, 9).Result()
+			for i := len(lastMsgs) - 1; i >= 0; i-- {
+				cli.chanName <- "HISTORY: " + lastMsgs[i]
+			}
+			
 		case cli := <- leaving:
 			delete(clients, cli)
 			close(cli.chanName)
