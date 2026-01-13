@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"context"
+	"os"
 	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/websocket"
 )
@@ -35,18 +36,24 @@ var (
 
 
 func main() {
+	// 環境変数REDIS_ADDRを取得し、空の場合はデフォルト値を使用する
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 
 	// Redisに接続
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "redis:6379", // docker-composeで指定したサービス名
+		Addr: redisAddr, // docker-composeで指定したサービス名
 	})
 
 	// 管理人(ブロードキャスター)を1つの独立した並行処理として起動
 	go broadcaster()
 
-	// HTTPハンドラの設定
+	// Redisからのメッセージを待ち受ける
+	go subscribeMessage()
+
 	http.HandleFunc("/ws", handleConnections)
-	// 静的ファイル(index.html)をルートで表示
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
 	fmt.Println("WebSocket Chat Server started on :8080")
@@ -111,17 +118,35 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 		text := string(msg)
 
+		var formattedMsg string
 		if strings.HasPrefix(text, "/nick ") {
 			username = strings.TrimPrefix(text, "/nick ")
 			messages <- "SYSTEM: User changed name to " + username
-			continue
+		} else {
+			formattedMsg = username + ": " + text
 		}
-		messages <- username + ": " + text
+		// messages <- username + ": " + text
+		// メッセージを「配信」
+		rdb.Publish(ctx, "chat_channel", formattedMsg)
 	}
 }
 
 func clientWriter(ws *websocket.Conn, ch <- chan string) {
 	for msg := range ch {
 		ws.WriteMessage(websocket.TextMessage, []byte(msg))
+	}
+}
+
+// メッセージを待ち受ける
+func subscribeMessage() {
+	pubsub := rdb.Subscribe(ctx, "chat_channel")
+	defer pubsub.Close()
+
+	ch := pubsub.Channel()
+	// Redisからメッセージが届くたびに、このループが回る
+	for msg := range ch {
+		// 届いたメッセージを、今まで通りinternalのmessagesチャネルに流す
+		// これにより、broadcasterが各クライアントへ配ってくれる
+		messages <- msg.Payload
 	}
 }

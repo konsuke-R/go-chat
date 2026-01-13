@@ -1,12 +1,20 @@
 version: "3.8"
 services:
   app:
-    build: .
+    build:
+      context: .
+      # 開発時はairが入っている'builder'ステージまでを使用
+      target: builder
     volumes:
       - .:/app
     ports:
       - "8080:8080"
-    command: ["go", "run", "main.go"]
+      - "8090:8090" # airのライブラリリロードプロキシ用
+    # DockerfileのCMDを上書きし、airで起動
+    command: ["air", "-c", ".air.toml"]
+    environment:
+      # 環境変数化しておくことで、将来的に本番と接続先を変えやすくなる
+      - REDIS_ADDR=redis:6379
     depends_on:
       - redis
   redis:
